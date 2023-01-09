@@ -1,0 +1,249 @@
+create or replace local temp table ecom_sandbox.sfw_exp_pop on commit preserve rows as	
+with testing as (	
+select	
+    * from (	
+    select ga.*, start_date, end_date,	
+    personalized_hit_id as exp_user_id, --only using the PID and not the Anon_PID	
+    dense_rank() over(	
+        partition by personalized_hit_id, 
+        unique_visit_id,
+        event_action,	
+        event_label	
+        order by	
+            hit_timestamp	
+    ) as act_rank	
+from	
+    ga.ga_sessions_hits ga	
+    inner join ecom_sandbox.pca_sfw_experiments as exp	
+        on ga.event_action = exp.test	
+        and exp.start_date <= ga_sessions_date 	
+        and (exp.end_date >= ga_sessions_date or exp.end_date is null)	
+where	
+    ga_sessions_date >= '2022-11-02' AND ga_sessions_date <= '2022-12-05'	
+    and load_type = 'daily'	
+    and is_bot = false	
+    and dataset = 'web'	
+  --and event_value = 1	
+    and event_category = 'optimizely' 	
+    and not rlike (event_label, '[0-9\. \-]+[0-9a-zA-Z\/ ]+')	
+    and event_action = '2022_10_SFW_PDP_WORD_CLOUDS'	
+    -- and event_action in ('2022_03_AS_ADD_MORE_ITEM', '2022_01_AS_SKIP_ITEM')	
+    and event_label not in ('6 Doses (6-mos. supply)', 'view-all-click', 'null', 'Beef')	
+    -- and (not is_completed or (is_completed and end_date = (select max(ga_sessions_date) as data_date from ga.ga_sessions where ga_sessions_date >= '2022-1-1' and load_type = 'daily')))	
+) as ranked	
+where	
+act_rank = 1),	
+	
+	
+-- identify the population that got activated into more than 1 treatment/control groups	
+-- scenario 1 - same session two variations seen	
+same_session_spillover as (	
+select distinct personalized_hit_id as exp_user_id from ga.ga_sessions_hits	
+where unique_visit_id in (	
+select unique_visit_id from ga.ga_sessions_hits	
+where ga_sessions_date between '2022-11-02' and '2022-12-05'	
+    and is_bot = false	
+    and dataset = 'web'	
+    and event_category = 'optimizely'	
+    and event_action = '2022_10_SFW_PDP_WORD_CLOUDS'	
+group by unique_visit_id	
+having count(distinct event_label) > 1) 	
+and ga_sessions_date between '2022-11-02' and '2022-12-05'	
+    and is_bot = false	
+    and dataset = 'web'	
+    and event_category = 'optimizely'	
+    and event_action = '2022_10_SFW_PDP_WORD_CLOUDS'	
+),	
+	
+-- scenario 2 - same customer ID two variations seen (could be in one session or across sessions)	
+multiple_session_spillover as (	
+select distinct personalized_hit_id as exp_user_id from ga.ga_sessions_hits	
+where customer_id in (	
+select customer_id from ga.ga_sessions_hits	
+where ga_sessions_date between '2022-11-02' and '2022-12-05'		
+    and is_bot = false	
+    and dataset = 'web'	
+    and event_category = 'optimizely'	
+    and event_action = '2022_10_SFW_PDP_WORD_CLOUDS'	
+group by customer_id	
+having count(distinct event_label) > 1)	
+and ga_sessions_date between '2022-11-02' and '2022-12-05'		
+    and is_bot = false	
+    and dataset = 'web'	
+    and event_category = 'optimizely'	
+    and event_action = '2022_10_SFW_PDP_WORD_CLOUDS'	
+)
+
+select 	
+    testing.ga_sessions_date, 	
+    testing.event_action as Test, 	
+    testing.event_label as Variation, 	
+    testing.unique_visit_id, 	
+    testing.exp_user_id, --The PID only, not that this is a server side exp. and Anon PID is not used	
+min(testing.hit_number) as activation_hit_number,  min(testing.hit_timestamp) as activation_time, lead(min(testing.hit_number), 1)over(partition by testing.unique_visit_id order by min(testing.hit_timestamp)) as next_activation, min(testing.start_date) as start_date, max(testing.end_date) as end_date	
+from testing 	
+left join same_session_spillover as s_spillover	
+on testing.exp_user_id = s_spillover.exp_user_id	
+left join multiple_session_spillover as m_spillover	
+on testing.exp_user_id = m_spillover.exp_user_id
+where s_spillover.exp_user_id is null and m_spillover.exp_user_id is null	
+group by 1,2,3,4,5;	
+	
+create or replace local temp table ecom_sandbox.sfw_exp_sessions on commit preserve rows as
+select
+  h.unique_visit_id,
+  h.hit_number,
+  h.unique_hit_id,
+  h.DEVICE_CATEGORY,
+  h.channel_grouping channel,
+  h.active_autoship_flag,
+  h.ga_sessions_date,
+  n.exp_user_id,
+  n.Test,
+  n.Variation,
+  h.transaction_id,
+  nvl(h.transaction_revenue, 0) as transaction_revenue,
+  nvl(h.transaction_units, 0) as transaction_units,
+  h.event_label,
+  h.event_action,
+  h.event_category,
+  h.ecommerce_action_type,
+  h.new_customer_flag,
+  h.promo_position_0,
+  h.promo_creative_0
+from
+  (select *, personalized_hit_id as exp_user_id
+   from ga.ga_sessions_hits where ga_sessions_date >= '2022-11-02' AND ga_sessions_date <= '2022-12-05' and dataset='web' and is_bot = false and load_type = 'daily') h
+inner join ecom_sandbox.sfw_exp_pop n 
+  on n.unique_visit_id = h.unique_visit_id and timediff(millisecond, h.hit_timestamp, activation_time) <= 1000 and n.start_date <= h.ga_sessions_date and (n.end_date >= h.ga_sessions_date or n.end_date is null);
+  
+SELECT DISTINCT event_label, event_action, event_category FROM ecom_sandbox.sfw_exp_sessions WHERE event_category='pdp-reviews';
+
+
+-- identify and count key activities
+create or replace local temp table ecom_sandbox.sfw_exp_before_final on commit preserve rows as
+select
+--h.device_category,
+--  h.active_autoship_flag,
+--  h.channel,
+--h.new_customer_flag,
+  h.Test,
+  h.Variation,
+  sum(case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.transaction_revenue else 0 end) as transaction_revenue,
+  COUNT(DISTINCT unique_visit_id) AS Total_Sessions,
+  COUNT(DISTINCT exp_user_id) AS Total_Users,
+  count(distinct case when (event_category = 'eec' AND event_action = 'detail' AND event_label in ('In Stock','Out of Stock') and ecommerce_action_type = '2')  then h.unique_visit_id end) as PDP_Sessions,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart') then h.unique_visit_id end) as ATC_Sessions,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart') then h.unique_hit_id end) as All_ATCs,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart' and event_label='pdp') then h.unique_hit_id end) as PDP_ATCs,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart' and event_label='pdp') then h.unique_visit_id end) as PDP_ATC_sessions,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.unique_visit_id end) as Purchase_Sessions,
+  count(distinct case when h.event_action = 'purchase' and h.transaction_id is not null then h.transaction_id end) as Orders,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.exp_user_id end) as User_Purchase,
+  COUNT(DISTINCT CASE WHEN event_action = 'addToAutoship' THEN h.unique_visit_id END) AS ATA_Sessions,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'impression' AND event_label='Word-cloud') then h.unique_hit_id end) as Word_Cloud_Impression,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then h.unique_hit_id end) as Word_Cloud_Click
+from ecom_sandbox.sfw_exp_sessions h
+group by
+  1,2;
+
+SELECT * FROM ecom_sandbox.sfw_exp_before_final;
+
+-- Device Type
+create or replace local temp table ecom_sandbox.sfw_exp_device on commit preserve rows as
+select
+  h.device_category,
+  h.Test,
+  h.Variation,
+  sum(case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.transaction_revenue else 0 end) as transaction_revenue,
+  COUNT(DISTINCT unique_visit_id) AS Total_Sessions,
+  COUNT(DISTINCT exp_user_id) AS Total_Users,
+  count(distinct case when (event_category = 'eec' AND event_action = 'detail' AND event_label in ('In Stock','Out of Stock') and ecommerce_action_type = '2')  then h.unique_visit_id end) as PDP_Sessions,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart') then h.unique_visit_id end) as ATC_Sessions,
+   count(distinct case when (event_category ='eec' AND event_action = 'addToCart' and event_label='pdp') then h.unique_visit_id end) as PDP_ATC_sessions,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.unique_visit_id end) as Purchase_Sessions,
+  count(distinct case when h.event_action = 'purchase' and h.transaction_id is not null then h.transaction_id end) as Orders,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.exp_user_id end) as User_Purchase,
+  COUNT(DISTINCT CASE WHEN event_action = 'addToAutoship' THEN h.unique_visit_id END) AS ATA_Sessions,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'impression' AND event_label='Word-cloud') then h.unique_hit_id end) as Word_Cloud_Impression,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then h.unique_hit_id end) as Word_Cloud_Click
+group by
+  1,2,3;
+
+SELECT * FROM ecom_sandbox.sfw_exp_device;
+
+-- New vs. Existing Customer
+create or replace local temp table ecom_sandbox.sfw_exp_new_vs_existing on commit preserve rows as
+select
+--h.device_category,
+--  h.active_autoship_flag,
+--  h.channel,
+  h.new_customer_flag,
+   h.Test,
+  h.Variation,
+  sum(case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.transaction_revenue else 0 end) as transaction_revenue,
+  COUNT(DISTINCT unique_visit_id) AS Total_Sessions,
+  COUNT(DISTINCT exp_user_id) AS Total_Users,
+  count(distinct case when (event_category = 'eec' AND event_action = 'detail' AND event_label in ('In Stock','Out of Stock') and ecommerce_action_type = '2')  then h.unique_visit_id end) as PDP_Sessions,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart') then h.unique_visit_id end) as ATC_Sessions,
+   count(distinct case when (event_category ='eec' AND event_action = 'addToCart' and event_label='pdp') then h.unique_visit_id end) as PDP_ATC_sessions,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.unique_visit_id end) as Purchase_Sessions,
+  count(distinct case when h.event_action = 'purchase' and h.transaction_id is not null then h.transaction_id end) as Orders,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.exp_user_id end) as User_Purchase,
+  COUNT(DISTINCT CASE WHEN event_action = 'addToAutoship' THEN h.unique_visit_id END) AS ATA_Sessions,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'impression' AND event_label='Word-cloud') then h.unique_hit_id end) as Word_Cloud_Impression,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then h.unique_hit_id end) as Word_Cloud_Click
+from ecom_sandbox.sfw_exp_sessions h
+group by
+  1,2,3;
+
+SELECT * FROM ecom_sandbox.sfw_exp_new_vs_existing;
+
+-- Channel
+create or replace local temp table ecom_sandbox.sfw_exp_channel on commit preserve rows as
+select
+--h.device_category,
+--  h.active_autoship_flag,
+  h.channel,
+-- h.new_customer_flag,
+   h.Test,
+  h.Variation,
+  sum(case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.transaction_revenue else 0 end) as transaction_revenue,
+  COUNT(DISTINCT unique_visit_id) AS Total_Sessions,
+  COUNT(DISTINCT exp_user_id) AS Total_Users,
+  count(distinct case when (event_category = 'eec' AND event_action = 'detail' AND event_label in ('In Stock','Out of Stock') and ecommerce_action_type = '2')  then h.unique_visit_id end) as PDP_Sessions,
+  count(distinct case when (event_category ='eec' AND event_action = 'addToCart') then h.unique_visit_id end) as ATC_Sessions,
+   count(distinct case when (event_category ='eec' AND event_action = 'addToCart' and event_label='pdp') then h.unique_visit_id end) as PDP_ATC_sessions,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.unique_visit_id end) as Purchase_Sessions,
+  count(distinct case when h.event_action = 'purchase' and h.transaction_id is not null then h.transaction_id end) as Orders,
+  count(distinct case when event_action='purchase' and event_category='eec' and transaction_id is not null then h.exp_user_id end) as User_Purchase,
+  COUNT(DISTINCT CASE WHEN event_action = 'addToAutoship' THEN h.unique_visit_id END) AS ATA_Sessions,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'impression' AND event_label='Word-cloud') then h.unique_hit_id end) as Word_Cloud_Impression,
+  COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then h.unique_hit_id end) as Word_Cloud_Click
+from ecom_sandbox.sfw_exp_sessions h
+group by
+  1,2,3;
+
+SELECT * FROM ecom_sandbox.sfw_exp_channel;
+
+-- Click Distribution by Word Clouds position
+create or replace local temp table ecom_sandbox.sfw_exp_CT1 on commit preserve rows as
+SELECT DISTINCT promo_position_0,Variation,
+       COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then unique_hit_id end) as Word_Cloud_Click
+from ecom_sandbox.sfw_exp_sessions
+GROUP BY 1,2;
+  
+SELECT * FROM ecom_sandbox.sfw_exp_CT1 ORDER BY Word_Cloud_Click DESC;
+
+-- Click Distribution by Strings
+create or replace local temp table ecom_sandbox.sfw_exp_CT2 on commit preserve rows as
+SELECT Test, 
+       promo_creative_0,
+       Variation,
+       COUNT(distinct case when (event_category = 'pdp-reviews' AND event_action = 'click' AND event_label='Word_cloud_chip') then unique_hit_id end) as Word_Cloud_Click
+from ecom_sandbox.sfw_exp_sessions
+group by 1,2,3;
+  
+SELECT * FROM ecom_sandbox.sfw_exp_CT2
+ORDER BY Word_Cloud_Click DESC
+LIMIT 50;
